@@ -1,17 +1,34 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use jni::objects::JString;
 use jni::{JNIEnv, errors::Error};
 
 fn get_java_exception(env: &mut JNIEnv) -> Result<String> {
-    if env.exception_check()? {
-        let exception = env.exception_occurred()?;
-        env.exception_clear().ok();
-        let message = env
-            .call_method(exception, "getMessage", "()Ljava/lang/String;", &[])?
-            .l()?;
-        let rust_message: String = env.get_string(&message.into())?.into();
-        return Ok(rust_message);
+    // A JavaException guarantees a pending exception; do not re-check.
+    let exception = env
+        .exception_occurred()
+        .context("ExceptionOccurred failed")?;
+
+    env.exception_clear().context("ExceptionClear failed")?;
+
+    // Try getMessage() first (may be null)
+    let message_obj = env
+        .call_method(&exception, "getMessage", "()Ljava/lang/String;", &[])
+        .context("Throwable.getMessage() failed")?
+        .l()
+        .ok();
+
+    if let Some(obj) = message_obj {
+        let jstr: JString = obj.into();
+        return Ok(env.get_string(&jstr)?.into());
     }
-    Err(anyhow::anyhow!("There is no exception"))
+
+    let to_string = env
+        .call_method(exception, "toString", "()Ljava/lang/String;", &[])
+        .context("Throwable.toString() failed")?
+        .l()?;
+
+    let jstr: JString = to_string.into();
+    Ok(env.get_string(&jstr)?.into())
 }
 
 pub trait JniResultExt<T> {
@@ -21,21 +38,23 @@ pub trait JniResultExt<T> {
 impl<T> JniResultExt<T> for Result<T, Error> {
     #[track_caller]
     fn check_exception(self, env: &mut JNIEnv) -> Result<T> {
+        let caller = std::panic::Location::caller();
+
         match self {
             Ok(v) => Ok(v),
-            Err(err) => match err {
-                jni::errors::Error::JavaException => {
-                    let msg = match get_java_exception(env) {
-                        Ok(msg) => msg,
-                        Err(err) => {
-                            tracing::warn!("Failed to get java exception : {err}");
-                            "failed to get java exception".into()
-                        }
-                    };
-                    anyhow::bail!("{msg}")
-                }
-                _ => Err(err.into()),
-            },
+
+            Err(Error::JavaException) => {
+                let msg = get_java_exception(env).unwrap_or_else(|e| {
+                    tracing::warn!("Failed to extract Java exception: {e}");
+                    "Java exception (failed to extract message)".to_owned()
+                });
+
+                Err(anyhow::anyhow!(msg))
+                    .with_context(|| format!("at {}:{}", caller.file(), caller.line()))
+            }
+
+            Err(err) => Err(anyhow::Error::from(err))
+                .with_context(|| format!("at {}:{}", caller.file(), caller.line())),
         }
     }
 }

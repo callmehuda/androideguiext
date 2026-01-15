@@ -6,6 +6,7 @@ use jni::{
 use ndk::native_window::NativeWindow;
 
 use crate::dex::util::inject_dex;
+use crate::jni::jni_result_ext::JniResultExt;
 
 pub struct JavaBridge<'a> {
     main_class: jni::objects::JClass<'a>,
@@ -20,24 +21,29 @@ impl<'a> JavaBridge<'a> {
     }
 
     pub fn call_main(&self, env: &mut JNIEnv<'a>) -> Result<()> {
-        let string_cls = env.find_class("java/lang/String")?;
-        let empty_array = env.new_object_array(0, string_cls, JObject::null())?;
+        let string_cls = env.find_class("java/lang/String").check_exception(env)?;
+        let empty_array = env
+            .new_object_array(0, string_cls, JObject::null())
+            .check_exception(env)?;
         env.call_static_method(
             &self.main_class,
             "main",
             "([Ljava/lang/String;)V",
             &[JValue::Object(&empty_array)],
-        )?;
+        )
+        .check_exception(env)?;
         Ok(())
     }
 
     pub fn get_display_size(&self, env: &mut JNIEnv<'a>) -> Result<(i32, i32, i32)> {
         let display_info_array: JIntArray = env
-            .call_static_method(&self.main_class, "getDisplayInfo", "()[I", &[])?
+            .call_static_method(&self.main_class, "getDisplayInfo", "()[I", &[])
+            .check_exception(env)?
             .l()?
             .into();
         let mut buf = vec![0i32; 3];
-        env.get_int_array_region(&display_info_array, 0, &mut buf)?;
+        env.get_int_array_region(&display_info_array, 0, &mut buf)
+            .check_exception(env)?;
         Ok((buf[0], buf[1], buf[2]))
     }
 
@@ -58,7 +64,8 @@ impl<'a> JavaBridge<'a> {
                     JValue::Bool(1), // isHide = true
                     JValue::Bool(0), // isSecure = false
                 ],
-            )?
+            )
+            .check_exception(env)?
             .l()?;
 
         let window = unsafe {

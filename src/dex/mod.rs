@@ -17,12 +17,13 @@ impl<'local> ClassLoader<'local> {
         env: &mut JNIEnv<'local>,
         class_name: &str,
     ) -> Result<JObject<'local>> {
+        let j_class_name = env.new_string(class_name).check_exception(env)?;
         let cls = env
             .call_method(
                 &self.0,
                 "findClass",
                 "(Ljava/lang/String;)Ljava/lang/Class;",
-                &[JValue::Object(&env.new_string(class_name).unwrap())],
+                &[JValue::Object(&j_class_name)],
             )
             .check_exception(env)?
             .l()?;
