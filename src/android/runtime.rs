@@ -5,6 +5,7 @@ use jni::{
 };
 use std::ffi::{CStr, CString, c_char, c_void};
 use tracing::info;
+
 use xdl_rs::Library;
 
 const ANDROID_RUNTIME_DSO: &str = "libandroid_runtime.so";
@@ -87,6 +88,8 @@ impl AndroidRuntime {
                 .handle
                 .get::<JniInvocationInit>("JniInvocationInit")
                 .ok_or(anyhow::anyhow!("JniInvocationInit symbol not found"))?;
+
+            // TODO: Fallback: manually find JniInvocation constructor and init method if symbols not found
 
             let invocation = create();
 
