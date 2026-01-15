@@ -13,7 +13,6 @@ pub struct Renderer {
     egl_surface: egl::Surface,
     #[allow(dead_code)]
     egl_context: egl::Context,
-    gl: Arc<glow::Context>,
     egui_context: egui::Context,
     egui_painter: egui_glow::Painter,
     egui_raw_input: egui::RawInput,
@@ -44,21 +43,15 @@ impl Renderer {
         let (major, minor) = egl.initialize(egl_display)?;
         info!("EGL Initialized: {}.{}", major, minor);
 
+        #[rustfmt::skip]
         let attribs = [
-            egl::BLUE_SIZE,
-            8,
-            egl::GREEN_SIZE,
-            8,
-            egl::RED_SIZE,
-            8,
-            egl::ALPHA_SIZE,
-            8,
-            egl::DEPTH_SIZE,
-            16,
-            egl::RENDERABLE_TYPE,
-            egl::OPENGL_ES3_BIT,
-            egl::SURFACE_TYPE,
-            egl::WINDOW_BIT,
+            egl::BLUE_SIZE, 8,
+            egl::GREEN_SIZE, 8,
+            egl::RED_SIZE, 8,
+            egl::ALPHA_SIZE, 8,
+            egl::DEPTH_SIZE, 16,
+            egl::RENDERABLE_TYPE, egl::OPENGL_ES3_BIT,
+            egl::SURFACE_TYPE, egl::WINDOW_BIT,
             egl::NONE,
         ];
 
@@ -120,7 +113,6 @@ impl Renderer {
             egl_surface,
             egl_context,
             egui_raw_input,
-            gl,
             egui_context,
             egui_painter,
             width,
@@ -131,9 +123,10 @@ impl Renderer {
 
     pub fn render<F: FnOnce(&egui::Context)>(&mut self, run_ui: F) {
         unsafe {
-            // self.gl.viewport(0, 0, self.width, self.height);
-            self.gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            self.gl.clear(glow::COLOR_BUFFER_BIT);
+            let gl = self.egui_painter.gl();
+            // gl.viewport(0, 0, self.width, self.height);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
         }
 
         let ctx = &mut self.egui_context;
