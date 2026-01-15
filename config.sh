@@ -22,16 +22,22 @@ PROFILE="debug"
 ARCH="arm64-v8a"
 
 # Argument Parsing
-if [[ "$1" == "dev" || "$1" == "debug" ]]; then
-    PROFILE="$1"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        "dev"|"debug")
+            PROFILE="$1"
+            ;;
+        "arm64-v8a"|"armeabi-v7a"|"x86"|"x86-64"|"x86_64")
+            ARCH="$1"
+            ;;
+        *)
+            echo "Error: Unknown argument '$1'"
+            echo "Usage: $0 [dev|debug] [arm64-v8a|armeabi-v7a|x86|x86_64]"
+            exit 1
+            ;;
+    esac
     shift
-fi
-
-# Check if the next arg is a valid arch, or if it was the first arg (handled by shift above? no)
-# If $1 is still set, it must be the arch
-if [[ -n "$1" ]]; then
-    ARCH="$1"
-fi
+done
 
 # Architecture Selection
 case "$ARCH" in
@@ -47,18 +53,13 @@ case "$ARCH" in
     "x86-64"|"x86_64")
         TARGET="x86_64-linux-android"
         ;;
-    *)
-        echo "Error: Unknown architecture '$ARCH'"
-        echo "Supported architectures: arm64-v8a, armeabi-v7a, x86, x86-64"
-        exit 1
-        ;;
 esac
 
 echo "Configuration: Profile=$PROFILE, Arch=$ARCH ($TARGET)"
 
 # NDK Toolchain Paths
 HOST_TAG="linux-x86_64"
-API_LEVEL=35
+API_LEVEL=29
 TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/$HOST_TAG"
 BIN="$TOOLCHAIN/bin"
 
