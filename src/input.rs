@@ -66,6 +66,73 @@ impl Default for SlotState {
     }
 }
 
+/// Per-device coordinate mapper.
+///
+/// Android touchscreen sensors are often physically oriented in landscape
+/// (the panel is wider than tall), even on a portrait phone. The driver
+/// reports raw ABS_MT_POSITION_X along the **long** axis of the sensor and
+/// ABS_MT_POSITION_Y along the **short** axis.  When the phone is held in
+/// portrait mode the long axis of the sensor is vertical on screen, so
+/// sensor-X → screen-Y and sensor-Y → screen-X.
+///
+/// We detect this by comparing the sensor aspect ratio (from ioctl ranges)
+/// with the screen aspect ratio: if they are inverted we set `swap_xy = true`.
+#[derive(Debug, Clone)]
+struct CoordMapper {
+    // Raw sensor ranges for each axis (from ioctl)
+    raw_x_min: i32,
+    raw_x_max: i32,
+    raw_y_min: i32,
+    raw_y_max: i32,
+    /// When true: sensor X → screen Y, sensor Y → screen X
+    swap_xy: bool,
+}
+
+impl CoordMapper {
+    fn new(ioctl_x: (i32, i32), ioctl_y: (i32, i32), screen_w: f32, screen_h: f32) -> Self {
+        let sensor_w = (ioctl_x.1 - ioctl_x.0).max(1) as f32;  // span along sensor-X
+        let sensor_h = (ioctl_y.1 - ioctl_y.0).max(1) as f32;  // span along sensor-Y
+        let sensor_ratio = sensor_w / sensor_h;   // >1 means sensor is landscape-oriented
+        let screen_ratio = screen_w / screen_h;   // <1 means screen is portrait
+
+        // If sensor aspect and screen aspect are "opposite" (one landscape, one portrait),
+        // swap the axes so sensor-X maps to screen-Y and vice-versa.
+        let swap_xy = (sensor_ratio > 1.0) != (screen_ratio > 1.0);
+
+        info!(
+            "CoordMapper: sensor span=({:.0}x{:.0}) ratio={:.3},              screen=({:.0}x{:.0}) ratio={:.3}, swap_xy={}",
+            sensor_w, sensor_h, sensor_ratio,
+            screen_w, screen_h, screen_ratio,
+            swap_xy
+        );
+
+        Self {
+            raw_x_min: ioctl_x.0,
+            raw_x_max: ioctl_x.1,
+            raw_y_min: ioctl_y.0,
+            raw_y_max: ioctl_y.1,
+            swap_xy,
+        }
+    }
+
+    /// Convert raw (sensor_x, sensor_y) → egui screen position.
+    fn to_screen(&self, raw_x: i32, raw_y: i32, screen_w: f32, screen_h: f32) -> egui::Pos2 {
+        let x_span = (self.raw_x_max - self.raw_x_min).max(1) as f32;
+        let y_span = (self.raw_y_max - self.raw_y_min).max(1) as f32;
+
+        // Normalized 0..1 in sensor space
+        let nx = (raw_x - self.raw_x_min) as f32 / x_span;
+        let ny = (raw_y - self.raw_y_min) as f32 / y_span;
+
+        if self.swap_xy {
+            // Sensor-X is vertical on screen, sensor-Y is horizontal
+            egui::pos2(ny * screen_w, nx * screen_h)
+        } else {
+            egui::pos2(nx * screen_w, ny * screen_h)
+        }
+    }
+}
+
 /// Read axis ranges from the kernel via ioctl EVIOCGABS.
 /// Returns (min, max) for a given abs axis code, or None on failure.
 fn read_abs_range(fd: i32, axis: u16) -> Option<(i32, i32)> {
@@ -200,9 +267,9 @@ pub fn start_input_thread(
                 .collect();
             let mut current_slot: Vec<usize> = vec![0; num_devices];
 
-            // Per-device axis ranges (read from kernel via ioctl)
-            let mut range_x: Vec<(i32, i32)> = vec![(0, 32767); num_devices];
-            let mut range_y: Vec<(i32, i32)> = vec![(0, 32767); num_devices];
+            // Per-device axis ranges (seeded from ioctl, refined live from events)
+            let mut ioctl_range_x: Vec<(i32, i32)> = vec![(0, 32767); num_devices];
+            let mut ioctl_range_y: Vec<(i32, i32)> = vec![(0, 32767); num_devices];
 
             // Single-touch (Protocol A) fallback state
             let mut st_x: Vec<i32> = vec![0; num_devices];
@@ -211,22 +278,34 @@ pub fn start_input_thread(
             let mut st_down: Vec<bool> = vec![false; num_devices];
             let mut st_was_down: Vec<bool> = vec![false; num_devices];
 
-            // Read axis ranges via ioctl for each device
+            // Seed axis ranges via ioctl (best-effort; refined live from events)
             for (dev_idx, file) in files.iter().enumerate() {
                 let fd = file.as_raw_fd();
                 if let Some(r) = read_abs_range(fd, ABS_MT_POSITION_X)
                     .or_else(|| read_abs_range(fd, ABS_X))
                 {
-                    range_x[dev_idx] = r;
-                    info!("Device {} X range: {:?}", dev_idx, r);
+                    ioctl_range_x[dev_idx] = r;
+                    info!("Device {} ioctl X range: {:?}", dev_idx, r);
+                } else {
+                    info!("Device {} ioctl X range: unavailable, using default 0..32767", dev_idx);
                 }
                 if let Some(r) = read_abs_range(fd, ABS_MT_POSITION_Y)
                     .or_else(|| read_abs_range(fd, ABS_Y))
                 {
-                    range_y[dev_idx] = r;
-                    info!("Device {} Y range: {:?}", dev_idx, r);
+                    ioctl_range_y[dev_idx] = r;
+                    info!("Device {} ioctl Y range: {:?}", dev_idx, r);
+                } else {
+                    info!("Device {} ioctl Y range: unavailable, using default 0..32767", dev_idx);
                 }
             }
+
+            // Build CoordMapper per device
+            let mappers: Vec<CoordMapper> = (0..num_devices)
+                .map(|i| CoordMapper::new(
+                    ioctl_range_x[i], ioctl_range_y[i],
+                    screen_width, screen_height,
+                ))
+                .collect();
 
             // epoll setup
             let epoll_fd = unsafe { libc::epoll_create1(0) };
@@ -310,7 +389,6 @@ pub fn start_input_thread(
                                 }
                                 ABS_MT_POSITION_Y => {
                                     slots[dev_idx][slot].y = evt.value;
-                                    slots[dev_idx][slot].has_pos = true;
                                 }
                                 ABS_X => {
                                     st_x[dev_idx] = evt.value;
@@ -334,16 +412,12 @@ pub fn start_input_thread(
                             }
 
                             let mut egui_events: Vec<egui::Event> = Vec::new();
-                            let (rx_min, rx_max) = range_x[dev_idx];
-                            let (ry_min, ry_max) = range_y[dev_idx];
-                            let rx_span = (rx_max - rx_min).max(1) as f32;
-                            let ry_span = (ry_max - ry_min).max(1) as f32;
 
-                            let normalize_x = |raw: i32| -> f32 {
-                                ((raw - rx_min) as f32 / rx_span) * screen_width
-                            };
-                            let normalize_y = |raw: i32| -> f32 {
-                                ((raw - ry_min) as f32 / ry_span) * screen_height
+                            let normalize = |raw_x: i32, raw_y: i32| -> egui::Pos2 {
+                                let pos = mappers[dev_idx].to_screen(raw_x, raw_y, screen_width, screen_height);
+                                debug!("raw({},{}) swap={} => screen({:.1},{:.1})",
+                                    raw_x, raw_y, mappers[dev_idx].swap_xy, pos.x, pos.y);
+                                pos
                             };
 
                             // ---- Protocol B: multitouch slots ----
@@ -374,9 +448,7 @@ pub fn start_input_thread(
                                         continue;
                                     }
 
-                                    let sx = normalize_x(slot.x);
-                                    let sy = normalize_y(slot.y);
-                                    let pos = egui::pos2(sx, sy);
+                                    let pos = normalize(slot.x, slot.y);
 
                                     let touch_id =
                                         egui::TouchId::from(dev_idx as u64 * 1000 + slot_idx as u64);
@@ -428,9 +500,7 @@ pub fn start_input_thread(
                             // ---- Protocol A single-touch fallback ----
                             // Only use if no MT events were produced for this device.
                             if !primary_slot_handled {
-                                let sx = normalize_x(st_x[dev_idx]);
-                                let sy = normalize_y(st_y[dev_idx]);
-                                let pos = egui::pos2(sx, sy);
+                                let pos = normalize(st_x[dev_idx], st_y[dev_idx]);
                                 let now_down = st_down[dev_idx];
                                 let was_down = st_was_down[dev_idx];
 
