@@ -1,0 +1,52 @@
+name: Android EGUI Ext Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      ANDROID_HOME: ${{ github.workspace }}/Android/Sdk
+      ANDROID_NDK_HOME: ${{ github.workspace }}/Android/Sdk/ndk/25.2.9519653
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install required packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libssl-dev
+
+      - name: Setup Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          sdk-version: 34
+          ndk-version: 25.2.9519653
+          
+      - name: Install Rust target for Android
+        run: rustup target add aarch64-linux-android
+
+      - name: Configure Cargo for Android (arm64-v8a)
+        run: |
+          chmod +x ./config.sh
+          ./config.sh debug arm64-v8a
+
+      - name: Build project
+        run: cargo build --release
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-egui-ext-binary
+          path: target/aarch64-linux-android/release/android-egui-ext

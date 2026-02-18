@@ -75,4 +75,34 @@ impl<'a> JavaBridge<'a> {
         };
         Ok(window)
     }
+
+    /// Inject a touch event via the Java InputManager bridge.
+    ///
+    /// # Parameters
+    /// - `action`: 0 = DOWN, 1 = UP, 2 = MOVE
+    /// - `pointer_id`: unique finger/pointer identifier (long)
+    /// - `x`: screen X coordinate in pixels
+    /// - `y`: screen Y coordinate in pixels
+    pub fn inject_touch_event(
+        &self,
+        env: &mut JNIEnv<'a>,
+        action: i32,
+        pointer_id: i64,
+        x: i32,
+        y: i32,
+    ) -> Result<()> {
+        env.call_static_method(
+            &self.main_class,
+            "injectTouchEvent",
+            "(IJII)V",
+            &[
+                JValue::Int(action),
+                JValue::Long(pointer_id),
+                JValue::Int(x),
+                JValue::Int(y),
+            ],
+        )
+        .check_exception(env)?;
+        Ok(())
+    }
 }

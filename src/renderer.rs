@@ -13,9 +13,9 @@ pub struct Renderer {
     egl_surface: egl::Surface,
     #[allow(dead_code)]
     egl_context: egl::Context,
-    egui_context: egui::Context,
-    egui_painter: egui_glow::Painter,
-    egui_raw_input: egui::RawInput,
+    pub egui_context: egui::Context,
+    pub egui_painter: egui_glow::Painter,
+    pub egui_raw_input: egui::RawInput,
     pub width: i32,
     pub height: i32,
     start_time: time::Instant,
@@ -119,6 +119,12 @@ impl Renderer {
             height,
             start_time: time::Instant::now(),
         })
+    }
+
+    /// Push a batch of egui events into the next frame's raw input.
+    /// Call this before `render()` with events received from the input thread.
+    pub fn push_events(&mut self, events: Vec<egui::Event>) {
+        self.egui_raw_input.events.extend(events);
     }
 
     pub fn render<F: FnOnce(&egui::Context)>(&mut self, run_ui: F) {
