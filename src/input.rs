@@ -76,34 +76,91 @@ impl Default for SlotState {
 /// sensor-X → screen-Y and sensor-Y → screen-X.
 ///
 /// We detect this by comparing the sensor aspect ratio (from ioctl ranges)
-/// with the screen aspect ratio: if they are inverted we set `swap_xy = true`.
+/// Maps raw sensor coordinates to egui screen coordinates.
+///
+/// A touchscreen sensor has a fixed physical orientation that never changes.
+/// Android reports the current display rotation (0/1/2/3) separately.
+/// We use BOTH the sensor's natural aspect ratio AND the display rotation
+/// to deterministically compute the correct swap + flip transform.
+///
+/// The 8 possible transforms are:
+///   swap_xy | flip_x | flip_y
+/// We pick the one that makes sensor movement match screen movement.
 #[derive(Debug, Clone)]
 struct CoordMapper {
-    // Raw sensor ranges for each axis (from ioctl)
     raw_x_min: i32,
     raw_x_max: i32,
     raw_y_min: i32,
     raw_y_max: i32,
-    /// When true: sensor X → screen Y, sensor Y → screen X
     swap_xy: bool,
+    flip_x: bool,
+    flip_y: bool,
 }
 
 impl CoordMapper {
-    fn new(ioctl_x: (i32, i32), ioctl_y: (i32, i32), screen_w: f32, screen_h: f32) -> Self {
-        let sensor_w = (ioctl_x.1 - ioctl_x.0).max(1) as f32;  // span along sensor-X
-        let sensor_h = (ioctl_y.1 - ioctl_y.0).max(1) as f32;  // span along sensor-Y
-        let sensor_ratio = sensor_w / sensor_h;   // >1 means sensor is landscape-oriented
-        let screen_ratio = screen_w / screen_h;   // <1 means screen is portrait
+    /// Construct from ioctl axis ranges + Android display rotation.
+    ///
+    /// `display_rotation`: value from Android WindowManager
+    ///   0 = ROTATION_0   (natural/portrait)
+    ///   1 = ROTATION_90  (landscape, rotated 90° clockwise)
+    ///   2 = ROTATION_180 (upside-down portrait)
+    ///   3 = ROTATION_270 (landscape, rotated 270° clockwise)
+    fn new(
+        ioctl_x: (i32, i32),
+        ioctl_y: (i32, i32),
+        screen_w: f32,
+        screen_h: f32,
+        display_rotation: i32,
+    ) -> Self {
+        let sensor_x_span = (ioctl_x.1 - ioctl_x.0).max(1) as f32;
+        let sensor_y_span = (ioctl_y.1 - ioctl_y.0).max(1) as f32;
 
-        // If sensor aspect and screen aspect are "opposite" (one landscape, one portrait),
-        // swap the axes so sensor-X maps to screen-Y and vice-versa.
-        let swap_xy = (sensor_ratio > 1.0) != (screen_ratio > 1.0);
+        // Is the sensor physically landscape-oriented?
+        // (its X axis is longer than its Y axis)
+        let sensor_is_landscape = sensor_x_span > sensor_y_span;
+
+        // Is the screen currently showing in landscape?
+        let screen_is_landscape = screen_w > screen_h;
+
+        // Step 1: Do we need to swap sensor X↔Y axes?
+        // We need a swap when sensor orientation differs from screen orientation.
+        // e.g. sensor is landscape but screen is portrait → swap.
+        let swap_xy = sensor_is_landscape != screen_is_landscape;
+
+        // Step 2: After potential swap, determine flips.
+        // Android rotation tells us the clockwise degrees the screen has been rotated
+        // from its natural orientation. We use this to pick the right flip.
+        //
+        // Convention after swap:
+        //   nx = 0..1 where 0=left, 1=right
+        //   ny = 0..1 where 0=top,  1=bottom
+        //
+        // For each rotation value, empirically:
+        //   ROTATION_0   (portrait natural)    : no flip
+        //   ROTATION_90  (landscape CW)        : flip_y
+        //   ROTATION_180 (portrait upside-down): flip_x + flip_y
+        //   ROTATION_270 (landscape CCW)       : flip_x
+        //
+        // If sensor is landscape-mounted (swap=true), the base orientation
+        // is different so we invert the flip logic.
+        let (flip_x, flip_y) = match display_rotation {
+            0 => (false, false),
+            1 => (false, true),
+            2 => (true,  true),
+            3 => (true,  false),
+            _ => (false, false),
+        };
+
+        // When we swap axes we also have to invert which flip applies to which axis,
+        // because after swap what was sensor-X is now occupying the Y screen slot.
+        // But since we swap before flipping, the flip flags already refer to the
+        // post-swap (screen-aligned) axes, so no extra inversion needed.
 
         info!(
-            "CoordMapper: sensor span=({:.0}x{:.0}) ratio={:.3},              screen=({:.0}x{:.0}) ratio={:.3}, swap_xy={}",
-            sensor_w, sensor_h, sensor_ratio,
-            screen_w, screen_h, screen_ratio,
-            swap_xy
+            "CoordMapper: sensor_span=({:.0}x{:.0}) sensor_landscape={}              screen=({:.0}x{:.0}) screen_landscape={} rotation={}              → swap={} flip_x={} flip_y={}",
+            sensor_x_span, sensor_y_span, sensor_is_landscape,
+            screen_w, screen_h, screen_is_landscape, display_rotation,
+            swap_xy, flip_x, flip_y
         );
 
         Self {
@@ -112,24 +169,27 @@ impl CoordMapper {
             raw_y_min: ioctl_y.0,
             raw_y_max: ioctl_y.1,
             swap_xy,
+            flip_x,
+            flip_y,
         }
     }
 
-    /// Convert raw (sensor_x, sensor_y) → egui screen position.
     fn to_screen(&self, raw_x: i32, raw_y: i32, screen_w: f32, screen_h: f32) -> egui::Pos2 {
         let x_span = (self.raw_x_max - self.raw_x_min).max(1) as f32;
         let y_span = (self.raw_y_max - self.raw_y_min).max(1) as f32;
 
-        // Normalized 0..1 in sensor space
-        let nx = (raw_x - self.raw_x_min) as f32 / x_span;
-        let ny = (raw_y - self.raw_y_min) as f32 / y_span;
+        // Normalize to 0..1 in sensor space
+        let mut nx = (raw_x - self.raw_x_min) as f32 / x_span;
+        let mut ny = (raw_y - self.raw_y_min) as f32 / y_span;
 
-        if self.swap_xy {
-            // Sensor-X is vertical on screen, sensor-Y is horizontal
-            egui::pos2(ny * screen_w, nx * screen_h)
-        } else {
-            egui::pos2(nx * screen_w, ny * screen_h)
-        }
+        // 1. Swap axes if sensor orientation differs from screen orientation
+        if self.swap_xy { std::mem::swap(&mut nx, &mut ny); }
+
+        // 2. Flip as needed for display rotation
+        if self.flip_x { nx = 1.0 - nx; }
+        if self.flip_y { ny = 1.0 - ny; }
+
+        egui::pos2(nx * screen_w, ny * screen_h)
     }
 }
 
@@ -230,6 +290,7 @@ fn find_touch_devices() -> Vec<String> {
 pub fn start_input_thread(
     screen_width: f32,
     screen_height: f32,
+    display_rotation: i32,
 ) -> mpsc::Receiver<Vec<egui::Event>> {
     let (tx, rx) = mpsc::channel::<Vec<egui::Event>>();
 
@@ -302,8 +363,11 @@ pub fn start_input_thread(
             // Build CoordMapper per device
             let mappers: Vec<CoordMapper> = (0..num_devices)
                 .map(|i| CoordMapper::new(
-                    ioctl_range_x[i], ioctl_range_y[i],
-                    screen_width, screen_height,
+                    ioctl_range_x[i],
+                    ioctl_range_y[i],
+                    screen_width,
+                    screen_height,
+                    display_rotation,
                 ))
                 .collect();
 

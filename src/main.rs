@@ -15,15 +15,18 @@ struct App {
     touch_pos: Option<egui::Pos2>,
     touch_count: u32,
     last_event: String,
+    /// Screen size passed in so we can show % info in UI
+    screen_size: egui::Vec2,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(screen_w: f32, screen_h: f32) -> Self {
         Self {
             checkbox_val: false,
             touch_pos: None,
             touch_count: 0,
             last_event: "none".to_string(),
+            screen_size: egui::vec2(screen_w, screen_h),
         }
     }
 
@@ -95,8 +98,18 @@ impl App {
                         egui::RichText::new(&self.last_event).color(egui::Color32::YELLOW),
                     );
                     ui.label(format!("Total touches: {}", self.touch_count));
+                    ui.label(format!(
+                        "Screen: {:.0} x {:.0}",
+                        self.screen_size.x, self.screen_size.y
+                    ));
                     if let Some(pos) = self.touch_pos {
-                        ui.label(format!("Current: ({:.0}, {:.0})", pos.x, pos.y));
+                        // Show both absolute px and % of screen so we can verify mapping
+                        let pct_x = pos.x / self.screen_size.x * 100.0;
+                        let pct_y = pos.y / self.screen_size.y * 100.0;
+                        ui.label(egui::RichText::new(format!(
+                            "px ({:.0}, {:.0})  =  {:.1}% , {:.1}%",
+                            pos.x, pos.y, pct_x, pct_y
+                        )).color(egui::Color32::from_rgb(100, 220, 255)));
                     } else {
                         ui.label(egui::RichText::new("No active touch").weak());
                     }
@@ -168,10 +181,10 @@ fn main() -> Result<()> {
 
     // Start the input reader thread.
     // It reads raw Linux multitouch events from /dev/input and converts them to egui events.
-    let input_rx = input::start_input_thread(width as f32, height as f32);
+    let input_rx = input::start_input_thread(width as f32, height as f32, rotation);
     info!("Input thread started");
 
-    let mut app = App::new();
+    let mut app = App::new(width as f32, height as f32);
 
     info!("Starting Render Loop");
     loop {
