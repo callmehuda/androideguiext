@@ -139,9 +139,9 @@ impl CoordMapper {
         // post-swap (screen-aligned) axes, so no extra inversion needed.
 
         info!(
-            "CoordMapper: sensor_span=({:.0}x{:.0}) sensor_landscape={}              screen=({:.0}x{:.0}) screen_landscape={} rotation={}              → swap={} flip_x={} flip_y={}",
-            sensor_x_span, sensor_y_span, sensor_is_landscape,
-            screen_w, screen_h, screen_is_landscape, display_rotation,
+            "CoordMapper: sensor_span=({:.0}x{:.0})              screen=({:.0}x{:.0}) rotation={}              → swap={} flip_x={} flip_y={}",
+            sensor_x_span, sensor_y_span,
+            screen_w, screen_h, display_rotation,
             swap_xy, flip_x, flip_y
         );
 
