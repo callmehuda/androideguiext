@@ -28,31 +28,29 @@ impl App {
     }
 
     fn update(&mut self, ctx: &egui::Context) {
-        // Track touch/pointer position from egui's own input state
+        // Collect touch/pointer events from egui's input state for this frame.
         ctx.input(|i| {
             for event in &i.events {
                 match event {
                     egui::Event::Touch { phase, pos, .. } => {
-                        self.touch_pos = Some(*pos);
                         match phase {
                             egui::TouchPhase::Start => {
                                 self.touch_count += 1;
-                                self.last_event = format!("Touch DOWN at ({:.0},{:.0})", pos.x, pos.y);
+                                self.touch_pos = Some(*pos);
+                                self.last_event =
+                                    format!("Touch DOWN ({:.0}, {:.0})", pos.x, pos.y);
                             }
                             egui::TouchPhase::Move => {
-                                self.last_event = format!("Touch MOVE at ({:.0},{:.0})", pos.x, pos.y);
+                                self.touch_pos = Some(*pos);
+                                self.last_event =
+                                    format!("Touch MOVE ({:.0}, {:.0})", pos.x, pos.y);
                             }
                             egui::TouchPhase::End | egui::TouchPhase::Cancel => {
                                 self.touch_pos = None;
-                                self.last_event = format!("Touch UP at ({:.0},{:.0})", pos.x, pos.y);
+                                self.last_event =
+                                    format!("Touch UP ({:.0}, {:.0})", pos.x, pos.y);
                             }
                         }
-                    }
-                    egui::Event::PointerMoved(pos) => {
-                        self.touch_pos = Some(*pos);
-                    }
-                    egui::Event::PointerGone => {
-                        self.touch_pos = None;
                     }
                     _ => {}
                 }
@@ -62,6 +60,25 @@ impl App {
         let dt = ctx.input(|i| i.unstable_dt);
         let fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
 
+        // ── Touch ripple indicator ───────────────────────────────────────────
+        // Drawn on the foreground layer OUTSIDE the window so it appears on top
+        // of everything and always follows the finger position correctly.
+        if let Some(pos) = self.touch_pos {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::from("touch_ripple_layer"),
+            ));
+            painter.circle(
+                pos,
+                24.0,
+                egui::Color32::from_rgba_unmultiplied(255, 200, 0, 60),
+                egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 200, 0)),
+            );
+            // Inner dot
+            painter.circle_filled(pos, 5.0, egui::Color32::from_rgb(255, 200, 0));
+        }
+
+        // ── Main window ───────────────────────────────────────────────────────
         egui::Window::new(format!("EGUI - FPS: {:.1}", fps))
             .id(egui::Id::from("MainWindow"))
             .default_pos(ctx.viewport_rect().center())
@@ -72,10 +89,11 @@ impl App {
                 ui.heading("Welcome to EGUI");
                 ui.separator();
 
-                // Touch status display
                 ui.group(|ui| {
                     ui.label("Touch Input Status");
-                    ui.label(egui::RichText::new(&self.last_event).color(egui::Color32::YELLOW));
+                    ui.label(
+                        egui::RichText::new(&self.last_event).color(egui::Color32::YELLOW),
+                    );
                     ui.label(format!("Total touches: {}", self.touch_count));
                     if let Some(pos) = self.touch_pos {
                         ui.label(format!("Current: ({:.0}, {:.0})", pos.x, pos.y));
@@ -97,36 +115,14 @@ impl App {
                 });
 
                 ui.collapsing("Expandable Section", |ui| {
-                    ui.label("Additional details can be shown here.");
+                    ui.label("Additional details.");
                     ui.checkbox(&mut self.checkbox_val, "Sample Checkbox");
                     if self.checkbox_val {
-                        ui.label(egui::RichText::new("Checkbox is ON").color(egui::Color32::GREEN));
+                        ui.label(
+                            egui::RichText::new("Checkbox is ON").color(egui::Color32::GREEN),
+                        );
                     }
                 });
-
-                ui.separator();
-
-                // Visual touch indicator
-                if let Some(pos) = self.touch_pos {
-                    let screen_rect = ctx.viewport_rect();
-                    // Show a touch ripple overlay
-                    egui::Area::new(egui::Id::from("touch_indicator"))
-                        .fixed_pos(pos - egui::vec2(24.0, 24.0))
-                        .order(egui::Order::Tooltip)
-                        .show(ctx, |ui| {
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(48.0, 48.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().circle(
-                                rect.center(),
-                                22.0,
-                                egui::Color32::from_rgba_unmultiplied(255, 200, 0, 80),
-                                egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 200, 0)),
-                            );
-                        });
-                    let _ = screen_rect; // suppress unused warning
-                }
             });
     }
 }

@@ -4,7 +4,6 @@ use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
 
 use tracing::{debug, info, warn};
 
@@ -24,17 +23,15 @@ const EV_SYN: u16 = 0x00;
 const EV_ABS: u16 = 0x03;
 const EV_KEY: u16 = 0x01;
 
-// ABS codes for multitouch
+// ABS codes for multitouch Protocol B
 const ABS_MT_SLOT: u16 = 0x2f;
 const ABS_MT_TRACKING_ID: u16 = 0x39;
 const ABS_MT_POSITION_X: u16 = 0x35;
 const ABS_MT_POSITION_Y: u16 = 0x36;
-const ABS_MT_PRESSURE: u16 = 0x3a;
 
-// Single touch fallback
+// Single touch fallback (Protocol A)
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
-const ABS_PRESSURE: u16 = 0x18;
 
 // SYN
 const SYN_REPORT: u16 = 0x00;
@@ -42,59 +39,90 @@ const SYN_REPORT: u16 = 0x00;
 // KEY codes
 const BTN_TOUCH: u16 = 0x14a;
 
-/// A raw touch point from the input system
+/// Slot state for multitouch Protocol B.
+/// `prev_tracking_id` lets us detect finger-down (Start) vs ongoing move.
 #[derive(Debug, Clone)]
-pub struct TouchPoint {
-    pub id: u64,
-    pub x: f32,
-    pub y: f32,
-    pub phase: TouchPhase,
+struct SlotState {
+    /// Current tracking id. -1 means the slot is free (finger lifted).
+    tracking_id: i32,
+    /// The tracking id we saw in the *previous* SYN_REPORT frame.
+    /// When tracking_id transitions from -1 → >=0 we emit TouchPhase::Start.
+    prev_tracking_id: i32,
+    x: i32,
+    y: i32,
+    /// Whether x/y have been set at least once (so we don't send garbage coords).
+    has_pos: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum TouchPhase {
-    Start,
-    Move,
-    End,
-}
-
-/// Converts to egui::TouchPhase
-impl From<TouchPhase> for egui::TouchPhase {
-    fn from(val: TouchPhase) -> Self {
-        match val {
-            TouchPhase::Start => egui::TouchPhase::Start,
-            TouchPhase::Move => egui::TouchPhase::Move,
-            TouchPhase::End => egui::TouchPhase::End,
+impl Default for SlotState {
+    fn default() -> Self {
+        Self {
+            tracking_id: -1,
+            prev_tracking_id: -1,
+            x: 0,
+            y: 0,
+            has_pos: false,
         }
     }
 }
 
-/// Slot state for multitouch protocol B
-#[derive(Debug, Clone, Default)]
-struct SlotState {
-    tracking_id: i32, // -1 = released
-    x: i32,
-    y: i32,
-    pressure: i32,
-    active: bool,
+/// Read axis ranges from the kernel via ioctl EVIOCGABS.
+/// Returns (min, max) for a given abs axis code, or None on failure.
+fn read_abs_range(fd: i32, axis: u16) -> Option<(i32, i32)> {
+    // struct input_absinfo { value, minimum, maximum, fuzz, flat, resolution }
+    #[repr(C)]
+    struct AbsInfo {
+        value: i32,
+        minimum: i32,
+        maximum: i32,
+        fuzz: i32,
+        flat: i32,
+        resolution: i32,
+    }
+    let mut info = AbsInfo {
+        value: 0,
+        minimum: 0,
+        maximum: 0,
+        fuzz: 0,
+        flat: 0,
+        resolution: 0,
+    };
+    // EVIOCGABS(axis) = _IOR('E', 0x40 + axis, struct input_absinfo)
+    // On 64-bit Linux: _IOR = (2 << 30) | (size << 16) | (type << 8) | nr
+    let size = std::mem::size_of::<AbsInfo>() as u64;
+    let ioctl_nr = (2u64 << 30) | (size << 16) | (b'E' as u64) << 8 | (0x40 + axis as u64);
+    let ret = unsafe { libc::ioctl(fd, ioctl_nr, &mut info as *mut _) };
+    if ret == 0 && info.maximum > info.minimum {
+        Some((info.minimum, info.maximum))
+    } else {
+        None
+    }
 }
 
-/// Find all touchscreen input devices under /dev/input/
+/// Find touchscreen input devices from /proc/bus/input/devices.
+/// Returns a list of /dev/input/eventX paths.
 fn find_touch_devices() -> Vec<String> {
     let mut devices = Vec::new();
 
-    // Try reading /proc/bus/input/devices to find touchscreen
     if let Ok(data) = fs::read_to_string("/proc/bus/input/devices") {
-        let mut current_handlers = Vec::new();
-        let mut is_touch = false;
+        let mut current_handlers: Vec<String> = Vec::new();
+        let mut has_abs = false;
+        let mut is_touch_name = false;
 
         for line in data.lines() {
             if line.starts_with("N: Name=") {
                 let name = line.to_lowercase();
-                is_touch = name.contains("touch")
-                    || name.contains("touchscreen")
+                is_touch_name = name.contains("touch")
                     || name.contains("ts")
-                    || name.contains("input");
+                    || name.contains("finger");
+                has_abs = false;
+                current_handlers.clear();
+            } else if line.starts_with("B: ABS=") {
+                // If ABS_MT_POSITION_X (bit 0x35 = 53) is set, it's a touchscreen.
+                // The ABS bitmap is hex, space-separated from MSB chunks.
+                // bit 53 is in the second hex word (bits 64-32 range).
+                // We just check if the device advertises *any* ABS capability.
+                has_abs = true;
             } else if line.starts_with("H: Handlers=") {
                 current_handlers.clear();
                 for part in line.split_whitespace() {
@@ -103,21 +131,22 @@ fn find_touch_devices() -> Vec<String> {
                     }
                 }
             } else if line.is_empty() {
-                if is_touch {
-                    for handler in &current_handlers {
-                        info!("Found potential touch device: {}", handler);
-                        devices.push(handler.clone());
+                if has_abs && (is_touch_name || !current_handlers.is_empty()) {
+                    for h in &current_handlers {
+                        info!("Found touch candidate: {}", h);
+                        devices.push(h.clone());
                     }
                 }
-                is_touch = false;
+                has_abs = false;
+                is_touch_name = false;
                 current_handlers.clear();
             }
         }
     }
 
-    // Fallback: try common event device paths
+    // Fallback: open all event devices
     if devices.is_empty() {
-        for i in 0..10 {
+        for i in 0..20 {
             let path = format!("/dev/input/event{}", i);
             if std::path::Path::new(&path).exists() {
                 devices.push(path);
@@ -128,27 +157,25 @@ fn find_touch_devices() -> Vec<String> {
     devices
 }
 
-/// Start a background thread that reads raw Linux touch events and converts them to egui events.
-/// Returns a receiver for egui events.
+/// Start a background thread reading raw Linux touch events.
+/// Emits properly sequenced egui events (Touch Start/Move/End + PointerButton + PointerMoved/Gone).
 pub fn start_input_thread(
     screen_width: f32,
     screen_height: f32,
 ) -> mpsc::Receiver<Vec<egui::Event>> {
     let (tx, rx) = mpsc::channel::<Vec<egui::Event>>();
-    let start_time = Instant::now();
 
     thread::Builder::new()
         .name("input-reader".into())
         .spawn(move || {
             let devices = find_touch_devices();
             if devices.is_empty() {
-                warn!("No input devices found. Touch input will not work.");
+                warn!("No input devices found.");
                 return;
             }
 
             info!("Opening input devices: {:?}", devices);
 
-            // Open all candidate devices
             let mut files: Vec<File> = devices
                 .iter()
                 .filter_map(|path| {
@@ -163,36 +190,47 @@ pub fn start_input_thread(
                 return;
             }
 
-            // For each device, maintain per-device slot state
             let num_devices = files.len();
+
+            // Per-device multitouch slot state (Protocol B, up to 10 fingers)
+            const MAX_SLOTS: usize = 10;
             let mut slots: Vec<Vec<SlotState>> = (0..num_devices)
-                .map(|_| {
-                    (0..10)
-                        .map(|_| SlotState {
-                            tracking_id: -1,
-                            ..Default::default()
-                        })
-                        .collect()
-                })
+                .map(|_| (0..MAX_SLOTS).map(|_| SlotState::default()).collect())
                 .collect();
-            let mut current_slots: Vec<usize> = vec![0; num_devices];
+            let mut current_slot: Vec<usize> = vec![0; num_devices];
 
-            // For single-touch fallback
-            let mut single_x: Vec<i32> = vec![0; num_devices];
-            let mut single_y: Vec<i32> = vec![0; num_devices];
-            let mut single_active: Vec<bool> = vec![false; num_devices];
+            // Per-device axis ranges (read from kernel via ioctl)
+            let mut range_x: Vec<(i32, i32)> = vec![(0, 32767); num_devices];
+            let mut range_y: Vec<(i32, i32)> = vec![(0, 32767); num_devices];
 
-            // Known max coords per device (we'll auto-detect from first events or assume 32767)
-            let mut max_x: Vec<i32> = vec![32767; num_devices];
-            let mut max_y: Vec<i32> = vec![32767; num_devices];
+            // Single-touch (Protocol A) fallback state
+            let mut st_x: Vec<i32> = vec![0; num_devices];
+            let mut st_y: Vec<i32> = vec![0; num_devices];
+            // 0=up, 1=down (tracking down state across frames)
+            let mut st_down: Vec<bool> = vec![false; num_devices];
+            let mut st_was_down: Vec<bool> = vec![false; num_devices];
 
-            let event_size = std::mem::size_of::<InputEvent>();
-            let mut buf = vec![0u8; event_size];
+            // Read axis ranges via ioctl for each device
+            for (dev_idx, file) in files.iter().enumerate() {
+                let fd = file.as_raw_fd();
+                if let Some(r) = read_abs_range(fd, ABS_MT_POSITION_X)
+                    .or_else(|| read_abs_range(fd, ABS_X))
+                {
+                    range_x[dev_idx] = r;
+                    info!("Device {} X range: {:?}", dev_idx, r);
+                }
+                if let Some(r) = read_abs_range(fd, ABS_MT_POSITION_Y)
+                    .or_else(|| read_abs_range(fd, ABS_Y))
+                {
+                    range_y[dev_idx] = r;
+                    info!("Device {} Y range: {:?}", dev_idx, r);
+                }
+            }
 
-            // Use epoll for non-blocking multi-device reading
+            // epoll setup
             let epoll_fd = unsafe { libc::epoll_create1(0) };
             if epoll_fd < 0 {
-                warn!("epoll_create failed");
+                warn!("epoll_create1 failed");
                 return;
             }
 
@@ -209,12 +247,11 @@ pub fn start_input_thread(
                 }
             }
 
-            let mut epoll_events = vec![
-                libc::epoll_event { events: 0, u64: 0 };
-                num_devices
-            ];
+            let mut epoll_events = vec![libc::epoll_event { events: 0, u64: 0 }; num_devices];
+            let event_size = std::mem::size_of::<InputEvent>();
+            let mut buf = vec![0u8; event_size];
 
-            info!("Input thread started. Listening for touch events...");
+            info!("Input thread listening for events...");
 
             loop {
                 let nfds = unsafe {
@@ -222,7 +259,7 @@ pub fn start_input_thread(
                         epoll_fd,
                         epoll_events.as_mut_ptr(),
                         num_devices as i32,
-                        100, // 100ms timeout
+                        50,
                     )
                 };
 
@@ -237,6 +274,7 @@ pub fn start_input_thread(
                         None => continue,
                     };
 
+                    // Read exactly one event struct at a time
                     let file = &mut files[dev_idx];
                     let n = match file.read(&mut buf) {
                         Ok(n) => n,
@@ -246,80 +284,101 @@ pub fn start_input_thread(
                         continue;
                     }
 
-                    let evt: InputEvent = unsafe { std::ptr::read(buf.as_ptr() as *const _) };
+                    let evt: InputEvent =
+                        unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const _) };
 
                     match evt.event_type {
                         EV_ABS => {
-                            let slot = current_slots[dev_idx];
+                            let slot = current_slot[dev_idx];
                             match evt.code {
                                 ABS_MT_SLOT => {
-                                    current_slots[dev_idx] = evt.value as usize;
+                                    let s = evt.value as usize;
+                                    if s < MAX_SLOTS {
+                                        current_slot[dev_idx] = s;
+                                    }
                                 }
                                 ABS_MT_TRACKING_ID => {
+                                    // Do NOT update prev_tracking_id here.
+                                    // We update it only after SYN_REPORT so we can
+                                    // compare before/after per frame.
                                     slots[dev_idx][slot].tracking_id = evt.value;
-                                    if evt.value >= 0 {
-                                        slots[dev_idx][slot].active = true;
-                                    }
                                 }
                                 ABS_MT_POSITION_X => {
                                     slots[dev_idx][slot].x = evt.value;
-                                    // Auto-detect range
-                                    if evt.value > max_x[dev_idx] {
-                                        max_x[dev_idx] = evt.value;
-                                    }
+                                    slots[dev_idx][slot].has_pos = true;
                                 }
                                 ABS_MT_POSITION_Y => {
                                     slots[dev_idx][slot].y = evt.value;
-                                    if evt.value > max_y[dev_idx] {
-                                        max_y[dev_idx] = evt.value;
-                                    }
+                                    slots[dev_idx][slot].has_pos = true;
                                 }
                                 ABS_X => {
-                                    single_x[dev_idx] = evt.value;
-                                    if evt.value > max_x[dev_idx] {
-                                        max_x[dev_idx] = evt.value;
-                                    }
+                                    st_x[dev_idx] = evt.value;
                                 }
                                 ABS_Y => {
-                                    single_y[dev_idx] = evt.value;
-                                    if evt.value > max_y[dev_idx] {
-                                        max_y[dev_idx] = evt.value;
-                                    }
+                                    st_y[dev_idx] = evt.value;
                                 }
                                 _ => {}
                             }
                         }
+
                         EV_KEY => {
                             if evt.code == BTN_TOUCH {
-                                single_active[dev_idx] = evt.value != 0;
+                                st_down[dev_idx] = evt.value != 0;
                             }
                         }
-                        EV_SYN => {
-                            if evt.code == SYN_REPORT {
-                                let mut egui_events = Vec::new();
-                                let mx = max_x[dev_idx].max(1) as f32;
-                                let my = max_y[dev_idx].max(1) as f32;
 
-                                // Multitouch Protocol B
-                                for (slot_idx, slot) in slots[dev_idx].iter_mut().enumerate() {
-                                    if !slot.active {
+                        EV_SYN => {
+                            if evt.code != SYN_REPORT {
+                                continue;
+                            }
+
+                            let mut egui_events: Vec<egui::Event> = Vec::new();
+                            let (rx_min, rx_max) = range_x[dev_idx];
+                            let (ry_min, ry_max) = range_y[dev_idx];
+                            let rx_span = (rx_max - rx_min).max(1) as f32;
+                            let ry_span = (ry_max - ry_min).max(1) as f32;
+
+                            let normalize_x = |raw: i32| -> f32 {
+                                ((raw - rx_min) as f32 / rx_span) * screen_width
+                            };
+                            let normalize_y = |raw: i32| -> f32 {
+                                ((raw - ry_min) as f32 / ry_span) * screen_height
+                            };
+
+                            // ---- Protocol B: multitouch slots ----
+                            let mut primary_slot_handled = false;
+
+                            for slot_idx in 0..MAX_SLOTS {
+                                let slot = &mut slots[dev_idx][slot_idx];
+                                let cur_tid = slot.tracking_id;
+                                let prev_tid = slot.prev_tracking_id;
+
+                                let phase = if prev_tid < 0 && cur_tid >= 0 {
+                                    // Finger just pressed down → Start
+                                    Some(egui::TouchPhase::Start)
+                                } else if prev_tid >= 0 && cur_tid < 0 {
+                                    // Finger lifted → End
+                                    Some(egui::TouchPhase::End)
+                                } else if cur_tid >= 0 && slot.has_pos {
+                                    // Finger still down and position updated → Move
+                                    Some(egui::TouchPhase::Move)
+                                } else {
+                                    None
+                                };
+
+                                if let Some(phase) = phase {
+                                    if !slot.has_pos && phase != egui::TouchPhase::End {
+                                        // No position yet; skip until we have coords
+                                        slot.prev_tracking_id = cur_tid;
                                         continue;
                                     }
 
-                                    let screen_x = (slot.x as f32 / mx) * screen_width;
-                                    let screen_y = (slot.y as f32 / my) * screen_height;
-                                    let pos = egui::pos2(screen_x, screen_y);
+                                    let sx = normalize_x(slot.x);
+                                    let sy = normalize_y(slot.y);
+                                    let pos = egui::pos2(sx, sy);
 
-                                    let (phase, released) = if slot.tracking_id < 0 {
-                                        // Finger released
-                                        (egui::TouchPhase::End, true)
-                                    } else {
-                                        (egui::TouchPhase::Move, false)
-                                    };
-
-                                    let touch_id = egui::TouchId::from(
-                                        (dev_idx as u64) * 1000 + slot_idx as u64,
-                                    );
+                                    let touch_id =
+                                        egui::TouchId::from(dev_idx as u64 * 1000 + slot_idx as u64);
 
                                     egui_events.push(egui::Event::Touch {
                                         device_id: egui::TouchDeviceId(dev_idx as u64),
@@ -329,45 +388,108 @@ pub fn start_input_thread(
                                         force: Some(1.0),
                                     });
 
-                                    // Also emit pointer events for primary finger (slot 0)
-                                    if slot_idx == 0 {
-                                        if released {
-                                            egui_events.push(egui::Event::PointerGone);
-                                        } else {
-                                            egui_events.push(egui::Event::PointerMoved(pos));
+                                    // Primary finger drives the logical pointer so egui
+                                    // widgets (buttons, sliders, etc.) respond correctly.
+                                    if slot_idx == 0 || !primary_slot_handled {
+                                        primary_slot_handled = true;
+                                        match phase {
+                                            egui::TouchPhase::Start => {
+                                                egui_events.push(egui::Event::PointerMoved(pos));
+                                                egui_events.push(egui::Event::PointerButton {
+                                                    pos,
+                                                    button: egui::PointerButton::Primary,
+                                                    pressed: true,
+                                                    modifiers: egui::Modifiers::NONE,
+                                                });
+                                            }
+                                            egui::TouchPhase::Move => {
+                                                egui_events.push(egui::Event::PointerMoved(pos));
+                                            }
+                                            egui::TouchPhase::End
+                                            | egui::TouchPhase::Cancel => {
+                                                egui_events.push(egui::Event::PointerButton {
+                                                    pos,
+                                                    button: egui::PointerButton::Primary,
+                                                    pressed: false,
+                                                    modifiers: egui::Modifiers::NONE,
+                                                });
+                                                egui_events.push(egui::Event::PointerGone);
+                                            }
                                         }
-                                    }
-
-                                    if released {
-                                        slot.active = false;
-                                        slot.tracking_id = -1;
                                     }
                                 }
 
-                                // Single-touch fallback
-                                if egui_events.is_empty() && single_active[dev_idx] {
-                                    let screen_x =
-                                        (single_x[dev_idx] as f32 / mx) * screen_width;
-                                    let screen_y =
-                                        (single_y[dev_idx] as f32 / my) * screen_height;
-                                    let pos = egui::pos2(screen_x, screen_y);
+                                // Commit: update prev_tracking_id and reset dirty flag
+                                slot.prev_tracking_id = cur_tid;
+                                slot.has_pos = false;
+                            }
 
+                            // ---- Protocol A single-touch fallback ----
+                            // Only use if no MT events were produced for this device.
+                            if !primary_slot_handled {
+                                let sx = normalize_x(st_x[dev_idx]);
+                                let sy = normalize_y(st_y[dev_idx]);
+                                let pos = egui::pos2(sx, sy);
+                                let now_down = st_down[dev_idx];
+                                let was_down = st_was_down[dev_idx];
+
+                                if now_down && !was_down {
+                                    // Finger down
                                     egui_events.push(egui::Event::Touch {
                                         device_id: egui::TouchDeviceId(dev_idx as u64),
-                                        id: egui::TouchId::from(0u64),
+                                        id: egui::TouchId::from(dev_idx as u64 * 1000),
+                                        phase: egui::TouchPhase::Start,
+                                        pos,
+                                        force: Some(1.0),
+                                    });
+                                    egui_events.push(egui::Event::PointerMoved(pos));
+                                    egui_events.push(egui::Event::PointerButton {
+                                        pos,
+                                        button: egui::PointerButton::Primary,
+                                        pressed: true,
+                                        modifiers: egui::Modifiers::NONE,
+                                    });
+                                } else if now_down {
+                                    // Drag
+                                    egui_events.push(egui::Event::Touch {
+                                        device_id: egui::TouchDeviceId(dev_idx as u64),
+                                        id: egui::TouchId::from(dev_idx as u64 * 1000),
                                         phase: egui::TouchPhase::Move,
                                         pos,
                                         force: Some(1.0),
                                     });
                                     egui_events.push(egui::Event::PointerMoved(pos));
+                                } else if !now_down && was_down {
+                                    // Finger up
+                                    egui_events.push(egui::Event::Touch {
+                                        device_id: egui::TouchDeviceId(dev_idx as u64),
+                                        id: egui::TouchId::from(dev_idx as u64 * 1000),
+                                        phase: egui::TouchPhase::End,
+                                        pos,
+                                        force: Some(1.0),
+                                    });
+                                    egui_events.push(egui::Event::PointerButton {
+                                        pos,
+                                        button: egui::PointerButton::Primary,
+                                        pressed: false,
+                                        modifiers: egui::Modifiers::NONE,
+                                    });
+                                    egui_events.push(egui::Event::PointerGone);
                                 }
 
-                                if !egui_events.is_empty() {
-                                    debug!("Sending {} egui events", egui_events.len());
-                                    let _ = tx.send(egui_events);
-                                }
+                                st_was_down[dev_idx] = now_down;
+                            }
+
+                            if !egui_events.is_empty() {
+                                debug!(
+                                    "dev={} sending {} events",
+                                    dev_idx,
+                                    egui_events.len()
+                                );
+                                let _ = tx.send(egui_events);
                             }
                         }
+
                         _ => {}
                     }
                 }
