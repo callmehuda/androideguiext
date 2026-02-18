@@ -88,9 +88,10 @@ fn read_abs_range(fd: i32, axis: u16) -> Option<(i32, i32)> {
         resolution: 0,
     };
     // EVIOCGABS(axis) = _IOR('E', 0x40 + axis, struct input_absinfo)
-    // On 64-bit Linux: _IOR = (2 << 30) | (size << 16) | (type << 8) | nr
+    // _IOR(type, nr, size) = (2<<30)|(sizeof<<16)|(type<<8)|nr
+    // Cast via u32 then as i32 (wrapping) — libc::ioctl takes Ioctl = i32 on Android.
     let size = std::mem::size_of::<AbsInfo>() as u32;
-    let ioctl_nr = ((2u32 << 30) | (size << 16) | ((b'E' as u32) << 8) | (0x40 + axis as u32)) as libc::c_ulong;
+    let ioctl_nr = ((2u32 << 30) | (size << 16) | ((b'E' as u32) << 8) | (0x40u32 + axis as u32)) as i32;
     let ret = unsafe { libc::ioctl(fd, ioctl_nr, &mut info as *mut _) };
     if ret == 0 && info.maximum > info.minimum {
         Some((info.minimum, info.maximum))
