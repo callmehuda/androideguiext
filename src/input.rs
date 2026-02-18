@@ -117,7 +117,7 @@ impl CoordMapper {
 
         // Is the sensor physically landscape-oriented?
         // (its X axis is longer than its Y axis)
-        let sensor_is_landscape = sensor_x_span < sensor_y_span;
+        let sensor_is_landscape = sensor_x_span > sensor_y_span;
 
         // Is the screen currently showing in landscape?
         let screen_is_landscape = screen_w > screen_h;
