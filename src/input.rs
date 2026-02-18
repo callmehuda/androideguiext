@@ -98,13 +98,6 @@ struct CoordMapper {
 }
 
 impl CoordMapper {
-    /// Construct from ioctl axis ranges + Android display rotation.
-    ///
-    /// `display_rotation`: value from Android WindowManager
-    ///   0 = ROTATION_0   (natural/portrait)
-    ///   1 = ROTATION_90  (landscape, rotated 90° clockwise)
-    ///   2 = ROTATION_180 (upside-down portrait)
-    ///   3 = ROTATION_270 (landscape, rotated 270° clockwise)
     fn new(
         ioctl_x: (i32, i32),
         ioctl_y: (i32, i32),
@@ -115,14 +108,6 @@ impl CoordMapper {
         let sensor_x_span = (ioctl_x.1 - ioctl_x.0).max(1) as f32;
         let sensor_y_span = (ioctl_y.1 - ioctl_y.0).max(1) as f32;
 
-        // For each rotation value, empirically:
-        //   ROTATION_0   (portrait natural)    : no flip
-        //   ROTATION_90  (landscape CW)        : flip_y
-        //   ROTATION_180 (portrait upside-down): flip_x + flip_y
-        //   ROTATION_270 (landscape CCW)       : flip_x
-        //
-        // If sensor is landscape-mounted (swap=true), the base orientation
-        // is different so we invert the flip logic.
         let (flip_x, flip_y) = match display_rotation {
             0 => (false, false),
             1 => (false, true),
@@ -131,25 +116,27 @@ impl CoordMapper {
             _ => (false, false),
         };
 
-
         let swap_xy = matches!(display_rotation, 1 | 3);
-        // When we swap axes we also have to invert which flip applies to which axis,
-        // because after swap what was sensor-X is now occupying the Y screen slot.
-        // But since we swap before flipping, the flip flags already refer to the
-        // post-swap (screen-aligned) axes, so no extra inversion needed.
+
+        // Tukar range jika swap_xy == false
+        let (raw_x_min, raw_x_max, raw_y_min, raw_y_max) = if swap_xy {
+            (ioctl_x.0, ioctl_x.1, ioctl_y.0, ioctl_y.1)
+        } else {
+            (ioctl_y.0, ioctl_y.1, ioctl_x.0, ioctl_x.1)
+        };
 
         info!(
-            "CoordMapper: sensor_span=({:.0}x{:.0})              screen=({:.0}x{:.0}) rotation={}              → swap={} flip_x={} flip_y={}",
+            "CoordMapper: sensor_span=({:.0}x{:.0}) screen=({:.0}x{:.0}) rotation={} → swap={} flip_x={} flip_y={}",
             sensor_x_span, sensor_y_span,
-            screen_w, screen_h, display_rotation,
-            swap_xy, flip_x, flip_y
+            screen_w, screen_h,
+            display_rotation, swap_xy, flip_x, flip_y
         );
 
         Self {
-            raw_x_min: ioctl_x.0,
-            raw_x_max: ioctl_x.1,
-            raw_y_min: ioctl_y.0,
-            raw_y_max: ioctl_y.1,
+            raw_x_min,
+            raw_x_max,
+            raw_y_min,
+            raw_y_max,
             swap_xy,
             flip_x,
             flip_y,
