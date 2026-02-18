@@ -74,12 +74,13 @@ The project includes a custom runner (`runner.sh`) configured by `config.sh`. Th
 
 *   ✅ **Rendering**: Renders the egui demo window.
 *   ✅ **JNI**: Successfully creates JVM and calls Java methods.
-*   ❌ **Input**: Touch/Input handling is currently **unimplemented**. Interaction with the GUI is not yet possible.
+*   ☑️ **Input**: Touch/Input handling is currently **experimental**. Interaction with the GUI is possible but there's a lot of bug.
 
 ## Compatibility
 
 This project has been tested and confirmed to work on:
 *   Android 13 (Waydroid)
+*   Android 14
 *   Android 16
 
 ## Credits
