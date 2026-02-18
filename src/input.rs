@@ -115,26 +115,6 @@ impl CoordMapper {
         let sensor_x_span = (ioctl_x.1 - ioctl_x.0).max(1) as f32;
         let sensor_y_span = (ioctl_y.1 - ioctl_y.0).max(1) as f32;
 
-        // Is the sensor physically landscape-oriented?
-        // (its X axis is longer than its Y axis)
-        let sensor_is_landscape = sensor_x_span < sensor_y_span;
-
-        // Is the screen currently showing in landscape?
-        let screen_is_landscape = screen_w < screen_h;
-
-        // Step 1: Do we need to swap sensor X↔Y axes?
-        // We need a swap when sensor orientation differs from screen orientation.
-        // e.g. sensor is landscape but screen is portrait → swap.
-        let swap_xy = sensor_is_landscape != screen_is_landscape;
-
-        // Step 2: After potential swap, determine flips.
-        // Android rotation tells us the clockwise degrees the screen has been rotated
-        // from its natural orientation. We use this to pick the right flip.
-        //
-        // Convention after swap:
-        //   nx = 0..1 where 0=left, 1=right
-        //   ny = 0..1 where 0=top,  1=bottom
-        //
         // For each rotation value, empirically:
         //   ROTATION_0   (portrait natural)    : no flip
         //   ROTATION_90  (landscape CW)        : flip_y
@@ -151,6 +131,8 @@ impl CoordMapper {
             _ => (false, false),
         };
 
+
+        let swap_xy = matches!(display_rotation, 1 | 3);
         // When we swap axes we also have to invert which flip applies to which axis,
         // because after swap what was sensor-X is now occupying the Y screen slot.
         // But since we swap before flipping, the flip flags already refer to the
