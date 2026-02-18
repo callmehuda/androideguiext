@@ -48,5 +48,5 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: android-egui-ext-binary
+          name: android-egui-ext-binary-${{ github.sha }}
           path: target/aarch64-linux-android/release/android-egui-ext
