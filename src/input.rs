@@ -117,10 +117,10 @@ impl CoordMapper {
 
         // Is the sensor physically landscape-oriented?
         // (its X axis is longer than its Y axis)
-        let sensor_is_landscape = sensor_x_span > sensor_y_span;
+        let sensor_is_landscape = sensor_x_span < sensor_y_span;
 
         // Is the screen currently showing in landscape?
-        let screen_is_landscape = screen_w > screen_h;
+        let screen_is_landscape = screen_w < screen_h;
 
         // Step 1: Do we need to swap sensor X↔Y axes?
         // We need a swap when sensor orientation differs from screen orientation.
@@ -144,7 +144,7 @@ impl CoordMapper {
         // If sensor is landscape-mounted (swap=true), the base orientation
         // is different so we invert the flip logic.
         let (flip_x, flip_y) = match display_rotation {
-            0 => (true, true),
+            0 => (false, false),
             1 => (false, true),
             2 => (true,  true),
             3 => (true,  false),
