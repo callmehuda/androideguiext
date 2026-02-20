@@ -80,6 +80,7 @@ impl App {
             // Inner dot
             painter.circle_filled(pos, 5.0, egui::Color32::from_rgb(255, 200, 0));
         }
+        catppuccin_egui::set_theme(&ctx, catppuccin_egui::MOCHA);
 
         // ── Main window ───────────────────────────────────────────────────────
         egui::Window::new(format!("EGUI - FPS: {:.1}", fps))
@@ -87,7 +88,9 @@ impl App {
             .default_pos(ctx.viewport_rect().center())
             .default_width(400.0)
             .default_height(300.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .resizable(true)
+            .title_bar(true)
+            //.anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.heading("Welcome to EGUI");
                 ui.separator();
